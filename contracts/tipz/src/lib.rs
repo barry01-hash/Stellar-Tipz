@@ -13,7 +13,11 @@
 
 #![no_std]
 
+#[cfg(any(test, feature = "testutils"))]
+extern crate std;
+
 pub mod admin;
+pub mod circuit_breaker;
 pub mod credit;
 pub mod errors;
 pub mod events;
@@ -21,8 +25,9 @@ pub mod fees;
 pub mod goals;
 pub mod leaderboard;
 pub mod migrations;
-pub mod multisig;
 pub mod multitoken;
+pub mod multisig;
+pub mod oracle;
 pub mod profile;
 pub mod refund;
 pub mod stats;
@@ -49,7 +54,7 @@ use crate::types::{
 
 /// The current contract interface version, stored on-chain during initialization.
 /// Must be incremented manually in source when the contract interface changes.
-pub const CONTRACT_VERSION: u32 = 3;
+pub const CONTRACT_VERSION: u32 = 4;
 
 #[contract]
 pub struct TipzContract;
@@ -107,6 +112,15 @@ impl TipzContract {
         x_handle: Option<String>,
     ) -> Result<(), ContractError> {
         profile::update_profile(&env, caller, display_name, bio, image_url, x_handle)
+    }
+
+    /// Update social links for a profile with limit enforcement (max 5 links).
+    pub fn update_social_links(
+        env: Env,
+        caller: Address,
+        social_links: soroban_sdk::Map<soroban_sdk::Symbol, String>,
+    ) -> Result<(), ContractError> {
+        profile::update_social_links(&env, caller, social_links)
     }
 
     /// Deregister the caller's profile, permanently removing it from the platform.
@@ -220,6 +234,11 @@ impl TipzContract {
     // ──────────────────────────────────────────────
 
     /// Send an XLM tip to a registered creator.
+    ///
+    /// Optional `expected_min_tip` and `expected_fee_bps` pin the config the
+    /// caller observed. A mismatch returns [`ContractError::ConfigMismatch`]
+    /// before any state change. Passing `None` for either preserves existing
+    /// behaviour for that check.
     pub fn send_tip(
         env: Env,
         tipper: Address,
@@ -228,6 +247,8 @@ impl TipzContract {
         message: String,
         is_anonymous: bool,
         is_encrypted: bool,
+        expected_min_tip: Option<i128>,
+        expected_fee_bps: Option<u32>,
     ) -> Result<(), ContractError> {
         tips::send_tip(
             &env,
@@ -237,6 +258,8 @@ impl TipzContract {
             &message,
             is_anonymous,
             is_encrypted,
+            expected_min_tip,
+            expected_fee_bps,
         )
     }
 
@@ -250,6 +273,37 @@ impl TipzContract {
         message: String,
     ) -> Result<(), ContractError> {
         tips::send_tip_on_behalf(&env, &sender, &on_behalf_of, &creator, amount, &message)
+    }
+
+    /// Send tips to multiple creators atomically.
+    ///
+    /// All recipients are validated before any transfers occur. If any recipient
+    /// is invalid or blocked, the entire batch reverts (all-or-nothing semantics).
+    /// Per-tip events emit individually, so the indexer needs no changes.
+    ///
+    /// # Parameters
+    /// - `from` – the address sending all tips (must authenticate)
+    /// - `recipients` – Vec<(creator_address, amount)>, max 5 entries, max 5 XLM per tip
+    /// - `message` – optional message (max 280 chars, sent with all tips)
+    ///
+    /// # Returns
+    /// Number of tips successfully sent on success.
+    ///
+    /// # Errors
+    /// - `BatchTooLarge` if more than max recipients
+    /// - `InvalidInput` if recipients is empty
+    /// - `NotRegistered` if any recipient has no profile
+    /// - `CannotTipSelf` if from tries to tip themselves
+    /// - `TipperBlocked` if any creator blocked from
+    /// - `BelowCreatorMinimum` if any tip is below creator's minimum
+    /// - Other send_tip errors (paused, rate limited, etc.)
+    pub fn batch_tip(
+        env: Env,
+        from: Address,
+        recipients: Vec<(Address, i128)>,
+        message: String,
+    ) -> Result<u32, ContractError> {
+        tips::batch_tip(&env, &from, recipients, &message)
     }
 
     /// Withdraw accumulated tips (fee deducted).
@@ -301,16 +355,22 @@ impl TipzContract {
         storage::get_migration_state(&env)
     }
 
-    /// Get a single tip record by its ID.
+    /// Get a single tip record by its ID (public view).
+    ///
+    /// For anonymous tips the sender is redacted to the contract address;
+    /// the stable `pseudonym` hash is still returned so clients can group
+    /// tips from one anonymous tipper without learning who sent them.
     ///
     /// Returns [`ContractError::NotFound`] when the tip does not exist or its
     /// temporary-storage TTL has expired (~7 days after the tip was sent).
     pub fn get_tip(env: Env, tip_id: u32) -> Result<Tip, ContractError> {
-        tips::get_tip(&env, tip_id).ok_or(ContractError::NotFound)
+        tips::get_tip_public(&env, tip_id).ok_or(ContractError::NotFound)
     }
 
     /// Return up to `limit` recent tips received by `creator`, newest first.
     ///
+    /// - Anonymous tips have their sender redacted to the contract address;
+    ///   use the stable `pseudonym` hash to group them instead.
     /// - `limit` is capped at 50 per call.
     /// - `offset`: number of tips to skip from the most recent (0 = start
     ///   from latest). Use `get_creator_tip_count` to know the total for
@@ -352,11 +412,7 @@ impl TipzContract {
         storage::get_tipper_tip_count(&env, &tipper)
     }
 
-    pub fn block_tipper(
-        env: Env,
-        creator: Address,
-        tipper: Address,
-    ) -> Result<(), ContractError> {
+    pub fn block_tipper(env: Env, creator: Address, tipper: Address) -> Result<(), ContractError> {
         tips::block_tipper(&env, &creator, &tipper)
     }
 
@@ -408,12 +464,79 @@ impl TipzContract {
         credit::get_credit_tier(&env, &address)
     }
 
-    /// Return the weighted credit score breakdown for a registered profile.
+    /// Return the weighted credit score breakdown for a registered profile,
+    /// including staleness metadata (`computed_at_ledger`, `ledger_age`, `is_stale`).
     pub fn get_credit_breakdown(
         env: Env,
         address: Address,
     ) -> Result<CreditBreakdown, ContractError> {
         credit::get_credit_breakdown(&env, &address)
+    }
+
+    /// Set the number of ledgers after which a stored credit score is considered
+    /// stale. Default is 8,640 ledgers (~12 hours at 5 s/ledger).
+    ///
+    /// # Authorization
+    /// Requires admin signature.
+    pub fn set_credit_staleness_threshold(
+        env: Env,
+        caller: Address,
+        threshold_ledgers: u32,
+    ) -> Result<(), ContractError> {
+        storage::extend_instance_ttl(&env);
+        admin::require_admin(&env, &caller)?;
+        storage::set_credit_staleness_threshold(&env, threshold_ledgers);
+        Ok(())
+    }
+
+    /// Recompute credit scores for a page of creators starting at `cursor`.
+    ///
+    /// Returns `(next_cursor, is_done)`. Call repeatedly with the returned
+    /// cursor until `is_done == true` to recompute the full set. `limit` is
+    /// clamped to 50 to bound per-call CPU usage.
+    ///
+    /// # Authorization
+    /// Requires admin signature.
+    pub fn recompute_credit_scores_page(
+        env: Env,
+        caller: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<(u32, bool), ContractError> {
+        storage::extend_instance_ttl(&env);
+        admin::require_admin(&env, &caller)?;
+        Ok(credit::recompute_credit_scores_page(&env, cursor, limit))
+    }
+
+    /// Register an on-chain price oracle for `token`.
+    /// The oracle must implement `get_price(token: Address) -> OraclePrice`.
+    ///
+    /// # Authorization
+    /// Requires admin signature.
+    pub fn set_token_oracle(
+        env: Env,
+        caller: Address,
+        token: Address,
+        oracle: Address,
+    ) -> Result<(), ContractError> {
+        oracle::set_token_oracle(&env, &caller, &token, &oracle)
+    }
+
+    /// Remove the price oracle for `token` (reverts to native-only ranking).
+    ///
+    /// # Authorization
+    /// Requires admin signature.
+    pub fn remove_token_oracle(
+        env: Env,
+        caller: Address,
+        token: Address,
+    ) -> Result<(), ContractError> {
+        oracle::remove_token_oracle(&env, &caller, &token)
+    }
+
+    /// Return the current staleness threshold in ledgers.
+    pub fn get_credit_staleness_threshold(env: Env) -> u32 {
+        storage::get_credit_staleness_threshold(&env)
     }
 
     /// Return the current supporter streak for a `(supporter, creator)` pair.
@@ -696,16 +819,16 @@ impl TipzContract {
         admin::upgrade(&env, &admin, &new_wasm_hash)
     }
 
-    pub fn pause(env: Env, caller: Address) -> Result<(), ContractError> {
-        admin::pause(&env, &caller)
+    pub fn pause(env: Env, caller: Address, flag: u32) -> Result<(), ContractError> {
+        admin::pause(&env, &caller, crate::types::PauseFlag::from_u32(flag))
     }
 
-    pub fn unpause(env: Env, caller: Address) -> Result<(), ContractError> {
-        admin::unpause(&env, &caller)
+    pub fn unpause(env: Env, caller: Address, flag: u32) -> Result<(), ContractError> {
+        admin::unpause(&env, &caller, crate::types::PauseFlag::from_u32(flag))
     }
 
-    pub fn is_paused(env: Env) -> bool {
-        storage::is_paused(&env)
+    pub fn is_paused(env: Env, flag: u32) -> bool {
+        storage::is_paused(&env, crate::types::PauseFlag::from_u32(flag))
     }
 
     pub fn set_min_tip_amount(
@@ -720,8 +843,60 @@ impl TipzContract {
         storage::get_min_tip_amount(&env)
     }
 
-    pub fn set_min_withdrawal_amount(env: Env, caller: Address, amount: i128) -> Result<(), ContractError> { admin::set_min_withdrawal_amount(&env, &caller, amount) }
-    pub fn get_min_withdrawal_amount(env: Env) -> i128 { storage::get_min_withdrawal_amount(&env) }
+    /// Set the minimum withdrawal amount. Admin only.
+    pub fn set_min_withdrawal_amount(
+        env: Env,
+        caller: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        admin::set_min_withdrawal_amount(&env, &caller, amount)
+    }
+
+    /// Get the minimum withdrawal amount.
+    pub fn get_min_withdrawal_amount(env: Env) -> i128 {
+        storage::get_min_withdrawal_amount(&env)
+    }
+
+    /// Configure the contract-level withdrawal circuit breaker. Admin only.
+    ///
+    /// When enabled, gross withdrawal volume is tracked in a bounded set of
+    /// buckets. Exceeding `threshold` within `window_secs` auto-pauses the
+    /// contract before the withdrawal transfers funds.
+    pub fn set_circuit_breaker_config(
+        env: Env,
+        caller: Address,
+        enabled: bool,
+        threshold: i128,
+        window_secs: u64,
+        bucket_count: u32,
+    ) -> Result<(), ContractError> {
+        circuit_breaker::configure(&env, &caller, enabled, threshold, window_secs, bucket_count)
+    }
+
+    /// Clear circuit-breaker volume buckets and unpause if the breaker tripped.
+    pub fn reset_circuit_breaker(env: Env, caller: Address) -> Result<(), ContractError> {
+        circuit_breaker::reset(&env, &caller)
+    }
+
+    /// Return current withdrawal circuit breaker configuration.
+    pub fn get_circuit_breaker_config(env: Env) -> crate::types::CircuitBreakerConfig {
+        circuit_breaker::get_config(&env)
+    }
+
+    /// Return current withdrawal circuit breaker fixed-bucket state.
+    pub fn get_circuit_breaker_status(env: Env) -> crate::types::CircuitBreakerStatus {
+        circuit_breaker::get_status(&env)
+    }
+
+    /// Set the maximum sender contribution to a creator's leaderboard score in basis points.
+    /// Admin only.
+    pub fn set_max_sender_contribution(
+        env: Env,
+        caller: Address,
+        bps: u32,
+    ) -> Result<(), ContractError> {
+        admin::set_max_sender_contribution(&env, &caller, bps)
+    }
 
     /// Update rate limit configuration. Admin only.
     pub fn set_rate_limit_config(

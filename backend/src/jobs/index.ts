@@ -1,5 +1,6 @@
 export { getQueue } from './queueFactory.js';
 export { scheduleRepeatable } from './scheduler.js';
+export { reportJobProgress, jobIdempotencyKey } from './progress.js';
 
 export {
   CREDIT_RECOMPUTE_QUEUE,
@@ -27,9 +28,14 @@ export {
 } from './subscriptionCharge.queue.js';
 export {
   processDueSubscriptions,
+  getNextDunningRetryAt,
   createSubscriptionChargeWorker,
   scheduleSubscriptionCharge,
 } from './subscriptionCharge.worker.js';
+export {
+  classifySubscriptionChargeFailure,
+  extractContractErrorCode,
+} from './subscriptionCharge.failure.js';
 
 export {
   LEADERBOARD_SNAPSHOT_QUEUE,
@@ -74,4 +80,22 @@ export {
 
 export { recordDeadLetter, attachDeadLetterHandler, listDeadLetterJobs } from './deadLetter.js';
 
+export {
+  AUTH_CHALLENGE_CLEANUP_QUEUE,
+  getAuthChallengeCleanupQueue,
+} from './authChallengeCleanup.queue.js';
+export {
+  cleanupExpiredChallenges,
+  createAuthChallengeCleanupWorker,
+  scheduleAuthChallengeCleanup,
+} from './authChallengeCleanup.worker.js';
+
 export { bootstrapJobs } from './main.js';
+
+export { RETENTION_QUEUE, getRetentionQueue } from './retention.queue.js';
+export {
+  RETENTION_DAYS,
+  runRetentionPrune,
+  createRetentionWorker,
+  scheduleRetentionPrune,
+} from './retention.worker.js';

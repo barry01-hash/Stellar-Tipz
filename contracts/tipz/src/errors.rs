@@ -54,6 +54,10 @@ pub enum ContractError {
     InvalidMessage = 48,
     SubLimitReached = 49,
     RefundReqExpired = 50,
+    /// Profile is inactive beyond the cleanup threshold
+    ProfileInactive = 51,
+    /// Storage limit exceeded for variable-size entry
+    StorageLimitExceeded = 52,
 }
 
 impl ContractError {
@@ -75,7 +79,7 @@ impl ContractError {
     pub const MigrationDowngradeRejected: Self = Self::MigrationDowngrade;
     pub const InvalidMigrationVersion: Self = Self::InvalidMigration;
     pub const SubscriptionLimitReached: Self = Self::SubLimitReached;
-    pub const RefundRequestExpired: Self = Self::RefundReqExpired;
+    pub const RefundRequestExpired: Self = Self::InvalidInput;
     pub const MultisigRequired: Self = Self::InvalidInput;
     pub const WdrBelowMin: Self = Self::ProposalExpired;
     pub const WithdrawalBelowMinimum: Self = Self::WdrBelowMin;
